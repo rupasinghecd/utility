@@ -1,0 +1,424 @@
+#!/usr/bin/env python3
+"""
+Generate a baseline Java call graph WITHOUT packaging a service JAR.
+
+✅ What this script does
+- Reads a manifest JSON (meta info) that describes how to build + where classes live
+- Runs "compile-only" (maven/gradle) to produce *.class under target/classes or build/classes
+- Runs a call graph generator tool (javacg or soot or jdeps)
+- Normalizes output to a clean class-to-class edge list
+- Writes graphs/call-graph.json
+
+✅ What you need installed
+- Java (matching repo’s target version ideally)
+- Maven or Gradle (depending on your repo)
+- One tool:
+  A) javacg (recommended easiest) -> a "javacg.jar" you supply
+  B) soot (more accurate, heavier) -> a "soot.jar" you supply
+  C) jdeps (built into JDK) -> lowest fidelity (deps-ish, not true calls)
+
+Run:
+  python scripts/generate_call_graph.py --manifest analysis-manifest.json
+
+Outputs:
+  graphs/call-graph.json
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+
+# -----------------------------
+# Manifest schema (example)
+# -----------------------------
+"""
+{
+  "service": "payment-service",
+  "repoPath": ".",
+  "buildTool": "maven",                        // "maven" | "gradle" | "none"
+  "compileOnly": true,                         // default true
+  "modules": ["payment-core", "payment-api"],  // optional; for maven -pl or gradle :module:
+  "buildCommand": null,                        // optional override array, e.g. ["mvn","-q","-DskipTests","compile"]
+  "classDirs": null,                           // optional override list of class dirs; if null script infers common dirs
+  "excludeClassPrefixes": [
+    "java.", "javax.", "jakarta.", "kotlin.", "scala.", "sun.", "com.sun.",
+    "org.springframework.", "org.apache.", "ch.qos.logback.", "org.slf4j."
+  ],
+  "tool": {
+    "type": "javacg",                          // "javacg" | "soot" | "jdeps"
+    "javacgJar": "tools/javacg.jar",           // required when type=javacg
+    "sootJar": "tools/soot.jar",               // required when type=soot
+    "extraArgs": []                            // optional extra tool args
+  },
+  "outputDir": "graphs"
+}
+"""
+
+
+# -----------------------------
+# Utilities
+# -----------------------------
+def run(cmd: List[str], cwd: Path, env: Optional[Dict[str, str]] = None) -> None:
+    print(f"\n▶ Running: {' '.join(cmd)}\n  cwd: {cwd}")
+    p = subprocess.run(cmd, cwd=str(cwd), env=env)
+    if p.returncode != 0:
+        raise RuntimeError(f"Command failed with exit code {p.returncode}: {' '.join(cmd)}")
+
+
+def which(cmd: str) -> Optional[str]:
+    return shutil.which(cmd)
+
+
+def read_json(path: Path) -> Dict[str, Any]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def write_json(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def is_windows() -> bool:
+    return os.name == "nt"
+
+
+# -----------------------------
+# Build step (compile-only)
+# -----------------------------
+def compile_only(manifest: Dict[str, Any], repo: Path) -> None:
+    build_tool = (manifest.get("buildTool") or "none").lower()
+    compile_only_flag = manifest.get("compileOnly", True)
+
+    if build_tool == "none":
+        print("ℹ️ buildTool=none. Skipping build step.")
+        return
+
+    if not compile_only_flag:
+        print("ℹ️ compileOnly=false (but script is intended for compile-only). Proceeding anyway.")
+
+    custom_cmd = manifest.get("buildCommand")
+    modules = manifest.get("modules") or []
+
+    if custom_cmd:
+        # User fully controls the build command.
+        run(custom_cmd, cwd=repo)
+        return
+
+    if build_tool == "maven":
+        if not which("mvn") and not which("mvn.cmd"):
+            raise RuntimeError("Maven not found on PATH (mvn).")
+        cmd = ["mvn", "-q", "-DskipTests", "compile"]
+        if modules:
+            # -pl builds selected modules; -am to also build required deps
+            cmd = ["mvn", "-q", "-DskipTests", "-pl", ",".join(modules), "-am", "compile"]
+        run(cmd, cwd=repo)
+        return
+
+    if build_tool == "gradle":
+        gradlew = "gradlew.bat" if is_windows() else "./gradlew"
+        if not (repo / ("gradlew.bat" if is_windows() else "gradlew")).exists():
+            # fallback to system gradle
+            if not which("gradle") and not which("gradle.bat"):
+                raise RuntimeError("Gradle not found (no gradlew and no gradle on PATH).")
+            gradlew = "gradle"
+        # compileJava is enough; classes is typical
+        if modules:
+            # For multi-module, call :module:classes for each
+            tasks = [f":{m}:classes" for m in modules]
+            cmd = [gradlew, "--quiet"] + tasks
+        else:
+            cmd = [gradlew, "--quiet", "classes"]
+        run(cmd, cwd=repo)
+        return
+
+    raise RuntimeError(f"Unsupported buildTool: {build_tool}")
+
+
+# -----------------------------
+# Class directories discovery
+# -----------------------------
+def discover_class_dirs(manifest: Dict[str, Any], repo: Path) -> List[Path]:
+    # If user provided, trust it
+    class_dirs = manifest.get("classDirs")
+    if class_dirs:
+        dirs = [repo / d for d in class_dirs]
+        existing = [d for d in dirs if d.exists()]
+        if not existing:
+            raise RuntimeError(f"classDirs were provided but none exist: {dirs}")
+        return existing
+
+    modules = manifest.get("modules") or []
+    build_tool = (manifest.get("buildTool") or "none").lower()
+
+    candidates: List[Path] = []
+
+    # Common maven default
+    def maven_dirs(base: Path) -> List[Path]:
+        return [base / "target" / "classes"]
+
+    # Common gradle default
+    def gradle_dirs(base: Path) -> List[Path]:
+        # Gradle differs; include both common paths
+        return [
+            base / "build" / "classes" / "java" / "main",
+            base / "build" / "classes" / "kotlin" / "main",
+            base / "build" / "classes" / "main",
+        ]
+
+    if modules:
+        for m in modules:
+            base = repo / m
+            if build_tool == "gradle":
+                candidates += gradle_dirs(base)
+            else:
+                candidates += maven_dirs(base)
+    else:
+        # Single-module / root project
+        if build_tool == "gradle":
+            candidates += gradle_dirs(repo)
+        else:
+            candidates += maven_dirs(repo)
+
+    existing = [c for c in candidates if c.exists()]
+    if not existing:
+        raise RuntimeError(
+            "Could not discover any compiled class directories. "
+            "Either build failed, or layout is non-standard. "
+            "Provide manifest.classDirs explicitly."
+        )
+    return existing
+
+
+# -----------------------------
+# Call graph generation tools
+# -----------------------------
+@dataclass
+class ToolConfig:
+    type: str
+    javacg_jar: Optional[Path]
+    soot_jar: Optional[Path]
+    extra_args: List[str]
+
+
+def parse_tool_config(manifest: Dict[str, Any], repo: Path) -> ToolConfig:
+    tool = manifest.get("tool") or {}
+    t = (tool.get("type") or "javacg").lower()
+    javacg_jar = tool.get("javacgJar")
+    soot_jar = tool.get("sootJar")
+    extra = tool.get("extraArgs") or []
+
+    return ToolConfig(
+        type=t,
+        javacg_jar=(repo / javacg_jar) if javacg_jar else None,
+        soot_jar=(repo / soot_jar) if soot_jar else None,
+        extra_args=list(extra),
+    )
+
+
+def generate_call_graph_raw(tool: ToolConfig, repo: Path, class_dirs: List[Path], out_dir: Path) -> Path:
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if tool.type == "javacg":
+        if not tool.javacg_jar or not tool.javacg_jar.exists():
+            raise RuntimeError("tool.type=javacg requires tool.javacgJar pointing to an existing jar file.")
+        raw_path = out_dir / "callgraph-raw.txt"
+
+        # Many javacg builds accept:
+        #   java -jar javacg.jar <classes_dir>
+        # If multiple class dirs, run each and concatenate.
+        with raw_path.open("w", encoding="utf-8") as w:
+            for cd in class_dirs:
+                cmd = ["java", "-jar", str(tool.javacg_jar), str(cd)] + tool.extra_args
+                print(f"\n▶ Running javacg on: {cd}")
+                p = subprocess.run(cmd, cwd=str(repo), stdout=w, stderr=subprocess.PIPE, text=True)
+                if p.returncode != 0:
+                    raise RuntimeError(f"javacg failed: {p.stderr.strip()}")
+        return raw_path
+
+    if tool.type == "soot":
+        if not tool.soot_jar or not tool.soot_jar.exists():
+            raise RuntimeError("tool.type=soot requires tool.sootJar pointing to an existing jar file.")
+        raw_path = out_dir / "soot-raw.txt"
+
+        # Soot output formats vary; we’ll run Soot and rely on its stdout/stderr logs;
+        # For production you’d configure a custom Soot transformer to dump edges.
+        # Here we provide a *working baseline runner*, but you will likely want a proper Soot edge dumper.
+        #
+        # Minimum invocation:
+        # -process-dir <classes>
+        # -w -app
+        # -p cg.spark enabled:true
+        # -allow-phantom-refs
+        #
+        # NOTE: Soot works best if you provide a correct classpath. At minimum include the class dirs.
+        # If you want better resolution, provide a manifest-provided classpathJars and pass them.
+        process_dir_args: List[str] = []
+        for cd in class_dirs:
+            process_dir_args += ["-process-dir", str(cd)]
+
+        cmd = [
+            "java",
+            "-cp",
+            str(tool.soot_jar),
+            "soot.Main",
+            *process_dir_args,
+            "-w",
+            "-app",
+            "-p", "cg.spark", "enabled:true",
+            "-allow-phantom-refs",
+            *tool.extra_args,
+        ]
+        # Capture combined output
+        print("\n⚠️ Soot baseline runner: for precise edge dumps, add a Soot transformer to print edges.")
+        p = subprocess.run(cmd, cwd=str(repo), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        raw_path.write_text(p.stdout, encoding="utf-8")
+        if p.returncode != 0:
+            raise RuntimeError(f"Soot failed. See {raw_path}")
+        return raw_path
+
+    if tool.type == "jdeps":
+        raw_path = out_dir / "jdeps-raw.txt"
+        # jdeps is dependency-ish, not true call graph; still useful as fallback.
+        cmd = ["jdeps", "-verbose:class"] + [str(cd) for cd in class_dirs] + tool.extra_args
+        p = subprocess.run(cmd, cwd=str(repo), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        raw_path.write_text(p.stdout, encoding="utf-8")
+        if p.returncode != 0:
+            raise RuntimeError(f"jdeps failed: {p.stderr.strip()}")
+        return raw_path
+
+    raise RuntimeError(f"Unsupported tool.type: {tool.type}")
+
+
+# -----------------------------
+# Normalization to class-level edges
+# -----------------------------
+def normalize_edges(
+    raw_text: str,
+    tool_type: str,
+    exclude_prefixes: List[str],
+) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
+    """
+    Returns (nodes, edges) where:
+      node: {"id": "com.foo.Bar"}
+      edge: {"from": "com.foo.A", "to": "com.foo.B", "relation": "calls"}
+    """
+
+    def excluded(cn: str) -> bool:
+        return any(cn.startswith(p) for p in exclude_prefixes)
+
+    nodes_set = set()
+    edges_set = set()
+
+    # javacg output formats vary a lot. We support common patterns by regex:
+    # Pattern examples seen:
+    #   M:com.foo.A:method (...)   M:com.bar.B:method (...)
+    #   com.foo.A.method -> com.bar.B.method
+    #
+    # We'll extract class names like com.foo.A and com.bar.B and collapse method-level to class-level.
+
+    class_pat = re.compile(r"([a-zA-Z_]\w*(?:\.[a-zA-Z_]\w*)+)")
+    arrow_pat = re.compile(r"(.+?)\s*(->|=>|→)\s*(.+)")
+
+    lines = raw_text.splitlines()
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+
+        # Try arrow format first
+        m = arrow_pat.search(line)
+        if m:
+            left, _, right = m.groups()
+            left_classes = class_pat.findall(left)
+            right_classes = class_pat.findall(right)
+            if left_classes and right_classes:
+                src = left_classes[0]
+                dst = right_classes[0]
+                if not excluded(src) and not excluded(dst) and src != dst:
+                    nodes_set.add(src); nodes_set.add(dst)
+                    edges_set.add((src, dst))
+            continue
+
+        # Fallback: grab first 2 fully-qualified class-like tokens
+        tokens = class_pat.findall(line)
+        if len(tokens) >= 2:
+            src, dst = tokens[0], tokens[1]
+            if not excluded(src) and not excluded(dst) and src != dst:
+                nodes_set.add(src); nodes_set.add(dst)
+                edges_set.add((src, dst))
+
+    nodes = [{"id": n} for n in sorted(nodes_set)]
+    edges = [{"from": s, "to": t, "relation": "calls"} for (s, t) in sorted(edges_set)]
+    return nodes, edges
+
+
+# -----------------------------
+# Main
+# -----------------------------
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--manifest", required=True, help="Path to analysis-manifest.json")
+    args = ap.parse_args()
+
+    manifest_path = Path(args.manifest).resolve()
+    if not manifest_path.exists():
+        raise SystemExit(f"Manifest not found: {manifest_path}")
+
+    manifest = read_json(manifest_path)
+
+    repo_path = Path(manifest.get("repoPath") or manifest_path.parent).resolve()
+    service = manifest.get("service") or repo_path.name
+    out_dir = repo_path / (manifest.get("outputDir") or "graphs")
+
+    exclude_prefixes = manifest.get("excludeClassPrefixes") or [
+        "java.", "javax.", "jakarta.", "kotlin.", "scala.", "sun.", "com.sun.",
+        "org.springframework.", "org.apache.", "ch.qos.logback.", "org.slf4j."
+    ]
+
+    # 1) Compile-only (no jar packaging)
+    compile_only(manifest, repo_path)
+
+    # 2) Discover compiled class dirs
+    class_dirs = discover_class_dirs(manifest, repo_path)
+    print("\n✅ Using class dirs:")
+    for d in class_dirs:
+        print(f"  - {d}")
+
+    # 3) Run tool
+    tool = parse_tool_config(manifest, repo_path)
+    raw_file = generate_call_graph_raw(tool, repo_path, class_dirs, out_dir)
+
+    # 4) Normalize
+    raw_text = raw_file.read_text(encoding="utf-8", errors="ignore")
+    nodes, edges = normalize_edges(raw_text, tool.type, exclude_prefixes)
+
+    call_graph = {
+        "service": service,
+        "tool": tool.type,
+        "classDirs": [str(d.relative_to(repo_path)) if d.is_relative_to(repo_path) else str(d) for d in class_dirs],
+        "excludeClassPrefixes": exclude_prefixes,
+        "nodes": nodes,
+        "edges": edges
+    }
+
+    write_json(out_dir / "call-graph.json", call_graph)
+    print(f"\n✅ Wrote: {out_dir / 'call-graph.json'}")
+    print(f"ℹ️ Raw tool output saved at: {raw_file}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        print(f"\n❌ ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
