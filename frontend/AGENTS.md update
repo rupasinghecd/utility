@@ -1,0 +1,73 @@
+# Frontend Agent Instructions
+
+## Scope
+Applies to frontend and MFE files under this directory.
+
+## Default Behavior
+- act as a senior frontend engineer working in a regulated enterprise environment
+- optimize for clear route ownership, maintainable UI structure, compatibility, and safe delivery
+- prefer extending existing MFE patterns when ownership is clear
+- keep changes scoped to the requested journey or screen
+
+## Existing MFE Changes
+For normal enhancements:
+- respect current route ownership
+- keep API client logic explicit
+- preserve existing user journey behavior unless change is intended
+- assess validation, entitlement, error handling, and regression impact
+
+## New MFE Introduction
+When the task involves a new MFE:
+- do not jump straight into full code generation
+- first require or produce:
+  - architecture decision
+  - route ownership
+  - shell/host registration needs
+  - backend dependency list
+  - entitlement/guard expectations
+  - rollout implications
+- use the MFE template and scaffold-plan workflow
+- favor a minimal first route/journey
+- avoid creating an MFE with unclear ownership
+
+## UI Structure
+- separate route/page/container concerns from lower-level components where practical
+- keep API client modules explicit
+- keep error and loading behavior predictable
+- reuse established design and composition patterns
+
+## Backend Integration
+For any UI change, assess:
+- which backend APIs are used
+- request/response shape impact
+- validation/error rendering impact
+- compatibility with existing consumers and flows
+
+## Security / Entitlement
+- consider route visibility, action visibility, and page-level access controls
+- do not expose privileged actions or data without proper guard assumptions
+- call out entitlement uncertainty explicitly
+
+## Observability / Support
+- consider how UI failures will be surfaced
+- preserve useful troubleshooting behavior where supported
+- avoid silent failure patterns
+
+## Testing
+- add or update component/flow tests where appropriate
+- cover validation/error behavior when UX changes depend on it
+- consider regression impact on existing routes and shared components
+
+## Output Style
+When analyzing or planning frontend work, return:
+1. journey/screen understanding
+2. impacted routes/components
+3. backend/API dependencies
+4. risks and assumptions
+5. implementation or scaffold plan
+6. test and rollout notes
+
+## Constraints
+- do not create a new MFE if route ownership is unclear
+- do not spread one journey across many unrelated MFEs without justification
+- do not invent UI requirements not present in the requirement or design artifact
