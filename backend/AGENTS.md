@@ -43,3 +43,20 @@ Applies to backend services and backend-supporting files under this directory.
 ## Security
 - Treat auth, entitlement, input validation, file handling, and external integrations as high-risk areas.
 - For security-sensitive code, slow down and explain reasoning before changing logic.
+
+## Spring Library Introduction
+When the task involves creating a reusable Spring library:
+- do not jump straight into implementation
+- first require or produce:
+  - library design decision
+  - reuse justification
+  - responsibility boundary
+  - public API/config surface
+  - Spring behavior model
+  - dependency/versioning model
+  - pilot consumer strategy
+- use the Spring library design and scaffold-plan workflows
+- keep public API small and explicit
+- avoid hiding service-specific business logic in shared libraries
+- avoid surprising autoconfiguration behavior
+- separate public API packages from internal implementation packages
