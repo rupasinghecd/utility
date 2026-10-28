@@ -1,0 +1,198 @@
+A production-grade Neo4j property graph schema for software lineage requires an explicit ApiContract (or Endpoint/Topic) intermediate node between services and micro-frontends. Connecting (:MicroFrontend)-[:DEPENDS_ON]->(:Microservice) directly is too coarse for Devin Desktop—by routing relationships through the contract and the exact CodeFile that implements or consumes it, your local Small Language Model (SLM) can hand Devin the exact repository, file path, and test command on step one.
+1. Node Schema & Properties
+Every node includes an access_group property to enforce private banking "Chinese Wall" RBAC boundaries (e.g., separating Wealth Management PII from Investment Banking) at query time.
+| Node Label | Primary Key (UNIQUE) | Key Properties | Purpose in Devin Context Brief |
+|---|---|---|---|
+| BitbucketRepo | repo_slug | project_key, clone_url, default_branch, build_cmd, test_cmd, access_group | Tells Devin which repo to target and the exact CLI command to verify builds locally without guessing. |
+| Microservice | service_id | name, domain, runtime (e.g., Java21, Python3.12), tier (Tier-1-Critical), owner_team | Identifies the backend bounded context and service criticality. |
+| MicroFrontend | mfe_id | name, route_prefix, framework, host_shell (e.g., AdvisorPortal), owner_team | Tracks UI modules dynamically loaded via Module Federation or single-spa. |
+| ApiContract | contract_id | protocol (REST, gRPC, Kafka), path_or_topic, http_method, DTO_schema_hash, spec_path | Acts as the "bridge" node between backend producers and MFE/service consumers. |
+| CodeFile | file_id | repo_slug, file_path, module_type (Controller, DTO, MFE_Client), last_commit_sha | Prevents Devin from running grep across repos by pointing directly to the implementation file. |
+| JiraTicket | issue_key | summary, status, issue_type, acceptance_criteria, updated_at, embedding | Anchors historical bug fixes, active requirements, and PR commit lineage. |
+| ConfluencePage | page_id | space_key, title, url, normative_rules_summary, last_verified_at, embedding | Stores compressed regulatory/compliance rules and architecture decisions. |
+2. Relationship (Edge) Schema
+(:BitbucketRepo)-[:HOSTS]->(:Microservice | :MicroFrontend)
+(:BitbucketRepo)-[:CONTAINS_FILE]->(:CodeFile)
+
+// 1st Hop: Producer to Contract
+(:Microservice)-[:EXPOSES {version: "v2", auth_scope: "wealth:read"}]->(:ApiContract)
+(:CodeFile)-[:IMPLEMENTS_PRODUCER]->(:ApiContract)
+
+// 2nd Hop: Contract to Downstream Consumers (Microservices or Micro-Frontends)
+(:MicroFrontend)-[:CONSUMES {criticality: "HIGH", fields_used: ["netAssetValue", "taxLot"]}]->(:ApiContract)
+(:Microservice)-[:CONSUMES {criticality: "MEDIUM", timeout_ms: 1500}]->(:ApiContract)
+(:CodeFile)-[:IMPLEMENTS_CONSUMER]->(:ApiContract)
+
+// Governance & Lineage Links
+(:JiraTicket)-[:MODIFIED_IN_PR {pr_id: 402, commit_sha: "a9f3c1"}]->(:CodeFile)
+(:JiraTicket)-[:TARGETS_COMPONENT]->(:Microservice | :MicroFrontend)
+(:ConfluencePage)-[:GOVERNS_COMPONENT {rule_type: "MAS_COMPLIANCE"}]->(:Microservice | :MicroFrontend | :ApiContract)
+
+3. Schema Initialization (Constraints & Indexes)
+Run these statements on Neo4j Community Edition (5.x / 2026.x) to enforce uniqueness constraints (which automatically create fast lookup indexes) and initialize a vector index for hybrid Confluence searches.
+// 1. Uniqueness Constraints (Auto-creates B-Tree/Range Indexes for fast traversal roots)
+CREATE CONSTRAINT repo_slug_unique IF NOT EXISTS FOR (r:BitbucketRepo) REQUIRE r.repo_slug IS UNIQUE;
+CREATE CONSTRAINT service_id_unique IF NOT EXISTS FOR (s:Microservice) REQUIRE s.service_id IS UNIQUE;
+CREATE CONSTRAINT mfe_id_unique IF NOT EXISTS FOR (m:MicroFrontend) REQUIRE m.mfe_id IS UNIQUE;
+CREATE CONSTRAINT contract_id_unique IF NOT EXISTS FOR (c:ApiContract) REQUIRE c.contract_id IS UNIQUE;
+CREATE CONSTRAINT file_id_unique IF NOT EXISTS FOR (f:CodeFile) REQUIRE f.file_id IS UNIQUE;
+CREATE CONSTRAINT jira_key_unique IF NOT EXISTS FOR (j:JiraTicket) REQUIRE j.issue_key IS UNIQUE;
+CREATE CONSTRAINT confluence_id_unique IF NOT EXISTS FOR (p:ConfluencePage) REQUIRE p.page_id IS UNIQUE;
+
+// 2. Vector Index for Confluence Specs (Assuming 768-dim local embedding model like nomic-embed-text or bge-base)
+CREATE VECTOR INDEX confluence_spec_embeddings IF NOT EXISTS
+FOR (p:ConfluencePage) ON (p.embedding)
+OPTIONS {
+  indexConfig: {
+    `vector.dimensions`: 768,
+    `vector.similarity_function`: 'cosine'
+  }
+};
+
+4. Parameterized Cypher Queries for 2-Hop Blast Radius
+Small Language Models (7B–14B) should never generate free-form multi-hop Cypher queries in production. Instead, expose the following parameterized queries as deterministic tools that the SLM calls by supplying JSON arguments ($service_id, $jira_key, $allowed_groups).
+Query A: 2-Hop Downstream & Upstream Blast Radius (By Component)
+When an engineer asks Devin to modify a microservice, this query traverses Hop 1 (Microservice -> ApiContract) and Hop 2 (ApiContract <- MicroFrontend / Microservice), returning the exact files and test commands across every affected Bitbucket repository.
+// Parameters: 
+// $target_service_id (String, e.g., "svc-portfolio-valuation")
+// $allowed_groups (List<String>, e.g., ["wealth-eng", "shared-platform"])
+
+MATCH (target:Microservice {service_id: $target_service_id})
+WHERE target.access_group IN $allowed_groups
+
+// Find host Bitbucket repo for the target service
+OPTIONAL MATCH (targetRepo:BitbucketRepo)-[:HOSTS]->(target)
+
+// HOP 1 & HOP 2 (Downstream): What contracts does target expose, and what MFEs/Services consume them?
+OPTIONAL MATCH (target)-[:EXPOSES]->(contract:ApiContract)<-[consumeRel:CONSUMES]-(consumer:Microservice|MicroFrontend)
+WHERE consumer.access_group IN $allowed_groups
+
+// Find exact producer & consumer code files and consumer repos
+OPTIONAL MATCH (producerFile:CodeFile)-[:IMPLEMENTS_PRODUCER]->(contract)
+OPTIONAL MATCH (consumerFile:CodeFile)-[:IMPLEMENTS_CONSUMER]->(contract)
+  WHERE (consumer)<-[:HOSTS]-(:BitbucketRepo)-[:CONTAINS_FILE]->(consumerFile)
+OPTIONAL MATCH (consumerRepo:BitbucketRepo)-[:HOSTS]->(consumer)
+
+// HOP 1 & HOP 2 (Upstream): What upstream contracts does target consume, and who owns them?
+OPTIONAL MATCH (target)-[:CONSUMES]->(upContract:ApiContract)<-[:EXPOSES]-(upstreamSvc:Microservice)
+WHERE upstreamSvc.access_group IN $allowed_groups
+
+// Governance: Fetch linked Confluence specs & recent Jira tickets on target or affected contracts
+OPTIONAL MATCH (doc:ConfluencePage)-[:GOVERNS_COMPONENT]->(govTarget)
+  WHERE govTarget IN [target, contract]
+OPTIONAL MATCH (jira:JiraTicket)-[:TARGETS_COMPONENT]->(target)
+  WHERE jira.status IN ['In Progress', 'Done']
+
+RETURN 
+  target.name AS target_service,
+  targetRepo.repo_slug AS target_repo,
+  targetRepo.test_cmd AS target_test_cmd,
+  collect(DISTINCT {
+    contract_path: contract.path_or_topic,
+    protocol: contract.protocol,
+    producer_file: producerFile.file_path,
+    consumer_name: consumer.name,
+    consumer_type: labels(consumer)[0],
+    consumer_repo: consumerRepo.repo_slug,
+    consumer_file: consumerFile.file_path,
+    consumer_test_cmd: consumerRepo.test_cmd,
+    fields_used: consumeRel.fields_used,
+    criticality: consumeRel.criticality
+  }) AS downstream_2hop_blast_radius,
+  collect(DISTINCT {
+    upstream_service: upstreamSvc.name,
+    contract_path: upContract.path_or_topic
+  }) AS upstream_dependencies,
+  collect(DISTINCT {
+    doc_title: doc.title,
+    url: doc.url,
+    rules_summary: doc.normative_rules_summary
+  }) AS compliance_and_specs,
+  collect(DISTINCT {
+    issue_key: jira.issue_key,
+    summary: jira.summary
+  })[0..5] AS recent_jiras;
+
+Query B: Jira-Anchored 2-Hop Context Hydration
+When an engineer simply types "Devin, implement ticket PB-4812", this query starts at the JiraTicket node, locates the target component or previously touched files in the same epic, and expands 2 hops out to identify breaking-change risks.
+// Parameters:
+// $jira_key (String, e.g., "PB-4812")
+// $allowed_groups (List<String>)
+
+MATCH (j:JiraTicket {issue_key: $jira_key})
+
+// 1. Identify direct target components linked to the ticket
+MATCH (j)-[:TARGETS_COMPONENT]->(comp:Microservice|MicroFrontend)
+WHERE comp.access_group IN $allowed_groups
+MATCH (repo:BitbucketRepo)-[:HOSTS]->(comp)
+
+// 2. Traverse 2 hops across API contracts from the impacted component
+OPTIONAL MATCH (comp)-[:EXPOSES|CONSUMES]-(contract:ApiContract)-[:EXPOSES|CONSUMES]-(peer:Microservice|MicroFrontend)
+WHERE peer <> comp AND peer.access_group IN $allowed_groups
+OPTIONAL MATCH (peerRepo:BitbucketRepo)-[:HOSTS]->(peer)
+OPTIONAL MATCH (contractFile:CodeFile)-[:IMPLEMENTS_PRODUCER|IMPLEMENTS_CONSUMER]->(contract)
+
+// 3. Find historical files modified by past Jira tickets on the same component (co-change pattern)
+OPTIONAL MATCH (pastJira:JiraTicket)-[:TARGETS_COMPONENT]->(comp)
+OPTIONAL MATCH (pastJira)-[:MODIFIED_IN_PR]->(historicalFile:CodeFile)<-[:CONTAINS_FILE]-(repo)
+WHERE pastJira <> j
+
+// 4. Pull governing Confluence pages
+OPTIONAL MATCH (doc:ConfluencePage)-[:GOVERNS_COMPONENT]->(comp)
+
+RETURN
+  j.issue_key AS ticket_id,
+  j.summary AS summary,
+  j.acceptance_criteria AS acceptance_criteria,
+  comp.name AS primary_component,
+  repo.repo_slug AS primary_repo,
+  repo.test_cmd AS primary_test_cmd,
+  collect(DISTINCT historicalFile.file_path)[0..10] AS likely_files_to_touch,
+  collect(DISTINCT {
+    affected_peer: peer.name,
+    peer_type: labels(peer)[0],
+    peer_repo: peerRepo.repo_slug,
+    shared_contract: contract.path_or_topic,
+    relevant_file: contractFile.file_path
+  }) AS two_hop_impacted_peers,
+  collect(DISTINCT {
+    title: doc.title,
+    rules: doc.normative_rules_summary
+  }) AS confluence_constraints;
+
+Query C: Hybrid Vector + 2-Hop Graph Expansion (For Unstructured Prompts)
+If the engineer gives an unstructured prompt (e.g., "Fix the rounding discrepancy in Swiss Franc withholding tax calculations"), the pipeline embeds the prompt locally, finds the top Confluence spec via vector similarity, and immediately walks 2 hops into the codebase.
+// Parameters:
+// $query_embedding (List<Float>, 768-dim vector)
+// $allowed_groups (List<String>)
+
+CALL db.index.vector.queryNodes('confluence_spec_embeddings', 3, $query_embedding)
+YIELD node AS doc, score
+WHERE score >= 0.72
+
+// Hop 1: Confluence Page -> Governed Microservice or ApiContract
+MATCH (doc)-[:GOVERNS_COMPONENT]->(comp:Microservice|ApiContract)
+WHERE comp.access_group IN $allowed_groups
+
+// Hop 2: Expand to implementing CodeFiles, Bitbucket Repos, and Downstream MFE Consumers
+OPTIONAL MATCH (repo:BitbucketRepo)-[:HOSTS]->(comp)
+OPTIONAL MATCH (comp)-[:EXPOSES]->(contract:ApiContract)<-[:CONSUMES]-(mfe:MicroFrontend)
+OPTIONAL MATCH (file:CodeFile)-[:IMPLEMENTS_PRODUCER|IMPLEMENTS_CONSUMER]->(contract)
+
+RETURN
+  doc.title AS matched_spec,
+  doc.normative_rules_summary AS business_rules,
+  score AS semantic_similarity,
+  labels(comp)[0] AS component_type,
+   coalesce(comp.name, comp.path_or_topic) AS component_identifier,
+  repo.repo_slug AS bitbucket_repo,
+  collect(DISTINCT file.file_path) AS implementation_files,
+  collect(DISTINCT mfe.name) AS impacted_micro_frontends
+ORDER BY score DESC;
+
+5. Automated Ingestion Strategy (Zero Manual Maintenance)
+To keep this graph accurate without creating manual overhead for your engineers, populate the nodes via three automated pipelines:
+ * Bitbucket Merge Webhooks + OpenAPI/Tree-sitter: On every merge to main, a lightweight CI job parses openapi.yaml / .proto files and TypeScript/Java imports to upsert (:Microservice), (:MicroFrontend), (:ApiContract), and (:CodeFile) nodes.
+ * PR Commit Message Hook: Enforce Jira keys in Bitbucket PR titles (e.g., feat(PB-4812): add tax lot field). A webhook parses the PR diff and writes the (:JiraTicket)-[:MODIFIED_IN_PR]->(:CodeFile) edges automatically.
+ * Confluence Nightly Sync: Poll the Confluence REST API for updated pages in architecture spaces, pass the body through your local SLM to generate the 150-word normative_rules_summary property (stripping out HTML boilerplate), embed it, and link any mentioned service names or Jira keys.
+Would you like the Python implementation for the MCP (Model Context Protocol) server that wraps these three Cypher queries and exposes them to Devin Desktop?
